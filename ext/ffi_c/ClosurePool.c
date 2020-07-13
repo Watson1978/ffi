@@ -66,6 +66,11 @@
 
 #include "ClosurePool.h"
 
+#if (defined(__arm64__) && defined(__APPLE__))
+#define USE_FFI_ALLOC 1
+#else
+#define USE_FFI_ALLOC 0
+#endif
 
 #ifndef roundup
 #  define roundup(x, y)   ((((x)+((y)-1))/(y))*(y))
@@ -88,7 +93,7 @@ struct ClosurePool_ {
 
 static long pageSize;
 
-static void* allocatePage(void);
+static void* allocateClosure(long size, void **code);
 static bool freePage(void *);
 static bool protectPage(void *);
 
@@ -139,12 +144,43 @@ rbffi_Closure_Alloc(ClosurePool* pool)
 {
     Closure *list = NULL;
     Memory* block = NULL;
+    void *pcl = NULL;
     void *code = NULL;
     char errmsg[256];
     int nclosures;
     long trampolineSize;
     int i;
 
+#if USE_FFI_ALLOC
+    {
+        Closure *closure = NULL;
+
+        block = calloc(1, sizeof(*block));
+        closure = calloc(1, sizeof(*closure));
+        pcl = allocateClosure(sizeof(ffi_closure), &code);
+
+        if (block == NULL || list == NULL || pcl == NULL) {
+            snprintf(errmsg, sizeof(errmsg), "failed to allocate a page. errno=%d (%s)", errno, strerror(errno));
+            goto error;
+        }
+
+        closure->pool = pool;
+        closure->code = code;
+        closure->pcl = pcl;
+
+        if (!(*pool->prep)(pool->ctx, closure->code, closure, errmsg, sizeof(errmsg))) {
+            goto error;
+        }
+
+        /* Track the allocated page + Closure memory area */
+        block->data = closure;
+        block->code = pcl;
+        pool->blocks = block;
+
+        /* Thread the new block onto the free list, apart from the first one. */
+        pool->refcnt++;
+    }
+#else
     if (pool->list != NULL) {
         Closure* closure = pool->list;
         pool->list = pool->list->next;
@@ -157,7 +193,7 @@ rbffi_Closure_Alloc(ClosurePool* pool)
     nclosures = (int) (pageSize / trampolineSize);
     block = calloc(1, sizeof(*block));
     list = calloc(nclosures, sizeof(*list));
-    code = allocatePage();
+    code = allocateClosure(pageSize, &code);
 
     if (block == NULL || list == NULL || code == NULL) {
         snprintf(errmsg, sizeof(errmsg), "failed to allocate a page. errno=%d (%s)", errno, strerror(errno));
@@ -169,6 +205,7 @@ rbffi_Closure_Alloc(ClosurePool* pool)
         closure->next = &list[i + 1];
         closure->pool = pool;
         closure->code = ((char *)code + (i * trampolineSize));
+        closure->pcl = closure->code;
 
         if (!(*pool->prep)(pool->ctx, closure->code, closure, errmsg, sizeof(errmsg))) {
             goto error;
@@ -189,6 +226,7 @@ rbffi_Closure_Alloc(ClosurePool* pool)
     list[nclosures - 1].next = pool->list;
     pool->list = list->next;
     pool->refcnt++;
+#endif
 
     /* Use the first one as the new handle */
     return list;
@@ -241,13 +279,19 @@ getPageSize()
 }
 
 static void*
-allocatePage(void)
+allocateClosure(long size, void **code)
 {
 #if !defined(__CYGWIN__) && (defined(_WIN32) || defined(__WIN32__))
-    return VirtualAlloc(NULL, pageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    *code = VirtualAlloc(NULL, page, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    return *code;
 #else
-    void *page = mmap(NULL, pageSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-    return (page != (void *) -1) ? page : NULL;
+#if USE_FFI_ALLOC
+    void *pcl = ffi_closure_alloc(size, code);
+    return pcl;
+#else
+    *code = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    return (*code != (void *) -1) ? *code : NULL;
+#endif
 #endif
 }
 
@@ -257,7 +301,12 @@ freePage(void *addr)
 #if !defined(__CYGWIN__) && (defined(_WIN32) || defined(__WIN32__))
     return VirtualFree(addr, 0, MEM_RELEASE);
 #else
+#if USE_FFI_ALLOC
+    ffi_closure_free(addr);
+    return true;
+#else
     return munmap(addr, pageSize) == 0;
+#endif
 #endif
 }
 
@@ -268,7 +317,11 @@ protectPage(void* page)
     DWORD oldProtect;
     return VirtualProtect(page, pageSize, PAGE_EXECUTE_READ, &oldProtect);
 #else
+#if USE_FFI_ALLOC
+    return true;
+#else
     return mprotect(page, pageSize, PROT_READ | PROT_EXEC) == 0;
+#endif
 #endif
 }
 
