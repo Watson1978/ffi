@@ -172,6 +172,7 @@ rbffi_Closure_Alloc(ClosurePool* pool)
         closure->next = &list[i + 1];
         closure->pool = pool;
         closure->code = ((char *)code + (i * trampolineSize));
+        closure->pcl  = closure->code;
 
         if (!(*pool->prep)(pool->ctx, closure->code, closure, errmsg, sizeof(errmsg))) {
             goto error;
